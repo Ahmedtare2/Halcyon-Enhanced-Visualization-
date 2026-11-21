@@ -1,19 +1,6 @@
-# Halcyon – import & build (with the Folia lyric visualizer)
-#
-# Put these files in the repository (all from the phone, nothing needs unzipping):
-#   .github/workflows/build.yml          this file
-#   Halcyon-main.zip                     the Halcyon source zip (any name; found by its settings.gradle.kts)
-#   folia-web-min.zip                    the trimmed Folia source (any name; found by its vite.config.ts)
-#   Halcyon-Folia-Visualizer-patch.zip   the patch zip(s) (any name; found by their apply.py / files/ folder)
-# Zips may sit in the repository root, in source/ or in patches/.
-#
-# What it does on the runner (never inside your repo):
-#   1. unpacks Halcyon and Folia
-#   2. applies the patch zips (Kotlin code for Halcyon + a small web host for Folia)
-#   3. builds Folia's real visualizer as a web bundle and bakes it into the APK's assets
-#   4. builds the arm64-v8a APK (release by default) and uploads it
-# If the patched app fails to compile it builds the plain app instead and prints the errors.
-# If the Folia bundle fails to build, the APK still builds and uses the built-in native styles.
+# Halcyon + Folia Android build
+# Upload the source archives and the single merged patch ZIP to the repository root.
+# This workflow detects archives by their contents, not by their filenames.
 
 name: Import and Build Halcyon
 
@@ -23,19 +10,20 @@ on:
       build_type:
         description: "Build type"
         required: true
-        default: "release"
+        default: release
         type: choice
         options:
           - release
           - debug
       use_patches:
-        description: "Apply the patch zips (turn off to build the plain app)"
+        description: "Apply the single merged A-D patch ZIP"
         required: true
         default: true
         type: boolean
   push:
     paths:
       - "*.zip"
+      - "**/*.zip"
       - "source/**"
       - "patches/**"
       - ".github/workflows/build.yml"
@@ -48,111 +36,695 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BUILD_TYPE: ${{ github.event.inputs.build_type || 'release' }}
-  USE_PATCHES: ${{ github.event.inputs.use_patches || 'true' }}
+  BUILD_TYPE: ${{ inputs.build_type || 'release' }}
+  # On push, patches are enabled. On manual runs, honour the boolean including false.
+  USE_PATCHES: ${{ github.event_name != 'workflow_dispatch' || inputs.use_patches }}
 
 jobs:
   build:
-    name: Import, patch, build Folia bundle and APK (arm64-v8a)
-    runs-on: ubuntu-latest
+    name: Import, patch, build Folia bundle and Android APK (arm64-v8a)
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
-
+    permissions:
+      contents: read
     steps:
-      - name: Checkout repository (zips + workflow only)
-        uses: actions/checkout@v4
+      - name: Check out uploaded source archives only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Import source zips (to build/ and folia/, not the repo root)
+      - name: Validate build options
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          mapfile -t ZIPS < <(printf '%s\n' ./*.zip source/*.zip patches/*.zip | sort)
-          BASE_ZIP=""
-          FOLIA_ZIP=""
-          for z in "${ZIPS[@]}"; do
-            [ -f "$z" ] || continue
-            names=$(unzip -Z1 "$z" 2>/dev/null || true)
-            if [ -z "$BASE_ZIP" ] && grep -qE '(^|/)settings\.gradle\.kts$' <<< "$names"; then
-              BASE_ZIP="$z"; continue
-            fi
-            if [ -z "$FOLIA_ZIP" ] && grep -qE '(^|/)vite\.config\.ts$' <<< "$names" && grep -q 'src/components/visualizer/' <<< "$names"; then
-              FOLIA_ZIP="$z"; continue
-            fi
-          done
-          if [ -z "$BASE_ZIP" ]; then
-            echo "::error::No Halcyon source zip found. Upload the Halcyon zip (it must contain settings.gradle.kts) to the repository root."
-            exit 1
-          fi
-          echo "Halcyon source: $BASE_ZIP"
-          rm -rf "$RUNNER_TEMP/base" build
-          mkdir -p "$RUNNER_TEMP/base"
-          unzip -q "$BASE_ZIP" -d "$RUNNER_TEMP/base"
-          ROOT=$(find "$RUNNER_TEMP/base" -maxdepth 3 -name settings.gradle.kts -printf '%d %h\n' | sort -n | head -1 | cut -d' ' -f2-)
-          mkdir build
-          cp -a "$ROOT/." build/
-          {
-            echo "BASE_ROOT=$ROOT"
-            echo "BASE_ZIP=$BASE_ZIP"
-          } >> "$GITHUB_ENV"
+          case "$BUILD_TYPE" in release|debug) ;; *) echo "::error::Invalid BUILD_TYPE: $BUILD_TYPE"; exit 1 ;; esac
+          case "$USE_PATCHES" in true|false) ;; *) echo "::error::Invalid USE_PATCHES: $USE_PATCHES"; exit 1 ;; esac
+          echo "Build type: $BUILD_TYPE"
+          echo "Patch application enabled: $USE_PATCHES"
 
-          HAVE_FOLIA=false
-          if [ -n "$FOLIA_ZIP" ]; then
-            echo "Folia source: $FOLIA_ZIP"
-            rm -rf "$RUNNER_TEMP/foliasrc" folia
-            mkdir -p "$RUNNER_TEMP/foliasrc"
-            unzip -q "$FOLIA_ZIP" -d "$RUNNER_TEMP/foliasrc"
-            FROOT=$(find "$RUNNER_TEMP/foliasrc" -maxdepth 3 -name vite.config.ts -printf '%d %h\n' | sort -n | head -1 | cut -d' ' -f2-)
-            mkdir folia
-            cp -a "$FROOT/." folia/
-            HAVE_FOLIA=true
-          else
-            echo "::warning::No Folia source zip found - the APK will only contain the built-in native styles."
-          fi
-          echo "HAVE_FOLIA=$HAVE_FOLIA" >> "$GITHUB_ENV"
-          echo "FOLIA_ZIP=$FOLIA_ZIP" >> "$GITHUB_ENV"
-
-      - name: Apply patch zips
+      - name: Import source archives safely and apply the merged patch
+        id: import
         shell: bash
+        env:
+          USE_PATCHES: ${{ env.USE_PATCHES }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          APPLIED=0
-          if [ "$USE_PATCHES" != "true" ]; then
-            echo "Patches are switched off for this run."
-          else
-            mapfile -t ZIPS < <(printf '%s\n' ./*.zip source/*.zip patches/*.zip | sort)
-            for p in "${ZIPS[@]}"; do
-              [ -f "$p" ] || continue
-              [ "$p" = "$BASE_ZIP" ] && continue
-              [ -n "$FOLIA_ZIP" ] && [ "$p" = "$FOLIA_ZIP" ] && continue
-              names=$(unzip -Z1 "$p" 2>/dev/null || true)
-              if ! grep -qE '(^|/)apply\.py$|(^|/)files/|(^|/)folia-host/' <<< "$names"; then
-                echo "Skipping $p (not a patch zip)"
-                continue
-              fi
-              d="$RUNNER_TEMP/patch-$(basename "$p" .zip | tr ' ' '_')"
-              rm -rf "$d"; mkdir -p "$d"
-              unzip -q "$p" -d "$d"
-              F=$(find "$d" -maxdepth 2 -type d -name files | head -1 || true)
-              H=$(find "$d" -maxdepth 2 -type d -name folia-host | head -1 || true)
-              A=$(find "$d" -maxdepth 2 -type f -name apply.py | head -1 || true)
-              if [ -n "$F" ]; then cp -a "$F/." build/; fi
-              if [ -n "$H" ] && [ "$HAVE_FOLIA" = "true" ]; then cp -a "$H/." folia/; fi
-              if [ -n "$A" ]; then python3 "$A" "$PWD/build"; fi
-              APPLIED=$((APPLIED + 1))
-              echo "Applied patch: $p"
-            done
-          fi
-          echo "PATCHES_APPLIED=$APPLIED" >> "$GITHUB_ENV"
-          echo "Patch zips applied: $APPLIED"
-          if [ "$HAVE_FOLIA" = "true" ] && [ ! -f folia/halcyon-host.html ]; then
-            echo "::warning::folia/halcyon-host.html is missing (patch zip without the Folia host?). Skipping the Folia bundle."
-            echo "HAVE_FOLIA=false" >> "$GITHUB_ENV"
-          fi
+          cat > "$RUNNER_TEMP/import_sources.py" <<'PY'
+          #!/usr/bin/env python3
+          """Safely import Halcyon, Folia and patch source archives for CI builds."""
+          from __future__ import annotations
 
-      - name: Set up Node.js 24
+          import hashlib
+          import os
+          import shutil
+          import stat
+          import subprocess
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          WORKSPACE = Path.cwd().resolve()
+          RUNNER_TEMP = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
+          STAGING = RUNNER_TEMP / "halcyon-import"
+          MAX_ENTRIES = 40_000
+          MAX_TOTAL_UNCOMPRESSED = 900 * 1024 * 1024
+          MAX_ARCHIVE_COMPRESSED = 300 * 1024 * 1024
+          MAX_COMPRESSION_RATIO = 2_000
+
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def candidate_zips() -> list[Path]:
+              found: set[Path] = set()
+              for folder in (WORKSPACE, WORKSPACE / "source", WORKSPACE / "patches"):
+                  if not folder.exists():
+                      continue
+                  if folder != WORKSPACE and folder.is_symlink():
+                      raise RuntimeError(f"Archive input directory must not be a symlink: {folder.name}/")
+                  for path in folder.glob("*.zip") if folder == WORKSPACE else folder.rglob("*.zip"):
+                      if path.is_symlink():
+                          raise RuntimeError(f"ZIP input must not be a symlink: {path.relative_to(WORKSPACE)}")
+                      if path.is_file() and ".git" not in path.parts:
+                          rel = path.relative_to(WORKSPACE).as_posix()
+                          if "\n" in rel or "\r" in rel:
+                              raise RuntimeError(f"ZIP filename contains a newline: {rel!r}")
+                          resolved = path.resolve(strict=True)
+                          try:
+                              resolved.relative_to(WORKSPACE)
+                          except ValueError as exc:
+                              raise RuntimeError(f"ZIP resolves outside repository workspace: {rel}") from exc
+                          found.add(resolved)
+              return sorted(found, key=lambda p: p.relative_to(WORKSPACE).as_posix().casefold())
+
+
+          def zip_member_names(path: Path) -> list[str] | None:
+              try:
+                  with zipfile.ZipFile(path) as zf:
+                      return [i.filename for i in zf.infolist()]
+              except (OSError, zipfile.BadZipFile, RuntimeError):
+                  print(f"::warning::Ignoring unreadable/non-project ZIP: {path.relative_to(WORKSPACE)}")
+                  return None
+
+
+          def rooted(names: list[str], marker: str, required: tuple[str, ...]) -> list[str]:
+              roots: set[str] = set()
+              for raw in names:
+                  normalized = raw.rstrip("/")
+                  if not normalized or PurePosixPath(normalized).name != marker:
+                      continue
+                  parent = str(PurePosixPath(normalized).parent)
+                  root = "" if parent == "." else parent
+                  present = set(names)
+                  def exists(rel: str) -> bool:
+                      candidate = f"{root}/{rel}" if root else rel
+                      return candidate in present
+                  if all(exists(item) for item in required):
+                      roots.add(root)
+              return sorted(roots)
+
+
+          def classify(path: Path, names: list[str]) -> tuple[str | None, str | None]:
+              base_roots = rooted(
+                  names,
+                  "settings.gradle.kts",
+                  ("gradlew", "app/build.gradle.kts", "tools/check_licenses.py"),
+              )
+              folia_roots = rooted(
+                  names,
+                  "vite.config.ts",
+                  ("package.json", "package-lock.json"),
+              )
+              # The visualizer path must live under the same project root as package.json.
+              folia_roots = [
+                  root for root in folia_roots
+                  if any(
+                      n.startswith((f"{root}/" if root else "") + "src/components/visualizer/")
+                      for n in names
+                  )
+              ]
+              patch_roots: set[str] = set()
+              for root in rooted(names, "apply.py", ()):
+                  prefix = f"{root}/" if root else ""
+                  if any(n.startswith(prefix + "files/") for n in names) or any(
+                      n.startswith(prefix + "folia-host/") for n in names
+                  ):
+                      patch_roots.add(root)
+              if len(base_roots) > 1:
+                  raise RuntimeError(f"{path.name}: multiple Halcyon project roots inside one ZIP: {base_roots}")
+              if len(folia_roots) > 1:
+                  raise RuntimeError(f"{path.name}: multiple Folia project roots inside one ZIP: {folia_roots}")
+              roles = []
+              if base_roots:
+                  roles.append(("base", base_roots[0]))
+              if folia_roots:
+                  roles.append(("folia", folia_roots[0]))
+              if patch_roots:
+                  if len(patch_roots) != 1:
+                      raise RuntimeError(f"{path.name}: multiple patch roots inside one ZIP: {sorted(patch_roots)}")
+                  roles.append(("patch", sorted(patch_roots)[0]))
+              if len(roles) > 1:
+                  raise RuntimeError(f"{path.name}: archive ambiguously matches multiple input types: {roles}")
+              return roles[0] if roles else (None, None)
+
+
+          def validate_archive(path: Path) -> None:
+              if path.stat().st_size > MAX_ARCHIVE_COMPRESSED:
+                  raise RuntimeError(f"ZIP is too large on disk ({path.stat().st_size} bytes): {path}")
+              try:
+                  with zipfile.ZipFile(path) as zf:
+                      infos = zf.infolist()
+                      if len(infos) > MAX_ENTRIES:
+                          raise RuntimeError(f"Too many ZIP entries ({len(infos)}): {path.name}")
+                      total = 0
+                      seen: dict[str, bool] = {}
+                      for info in infos:
+                          raw = info.filename
+                          if not raw or "\x00" in raw or "\\" in raw or "\n" in raw or "\r" in raw:
+                              raise RuntimeError(f"Unsafe ZIP member name in {path.name}: {raw!r}")
+                          trimmed = raw[:-1] if raw.endswith("/") else raw
+                          member = PurePosixPath(trimmed)
+                          if member.is_absolute() or not trimmed or any(part in ("", ".", "..") for part in trimmed.split("/")):
+                              raise RuntimeError(f"Unsafe ZIP path in {path.name}: {raw!r}")
+                          if member.parts and (":" in member.parts[0] or member.parts[0].startswith("~")):
+                              raise RuntimeError(f"Drive/home path is not allowed in {path.name}: {raw!r}")
+                          normalized = member.as_posix()
+                          is_dir = info.is_dir()
+                          if normalized in seen and not (is_dir and seen[normalized]):
+                              raise RuntimeError(f"Duplicate ZIP member in {path.name}: {normalized}")
+                          seen[normalized] = is_dir
+                          mode = (info.external_attr >> 16) & 0xFFFF
+                          kind = stat.S_IFMT(mode)
+                          if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                              raise RuntimeError(f"Symlink/special file is not allowed in {path.name}: {raw!r}")
+                          if info.flag_bits & 0x1:
+                              raise RuntimeError(f"Encrypted ZIP entries are not supported: {path.name}")
+                          if not is_dir:
+                              total += info.file_size
+                              if total > MAX_TOTAL_UNCOMPRESSED:
+                                  raise RuntimeError(f"Uncompressed ZIP exceeds safety limit: {path.name}")
+                              if info.file_size > 1024 * 1024:
+                                  if info.compress_size == 0 or info.file_size / info.compress_size > MAX_COMPRESSION_RATIO:
+                                      raise RuntimeError(f"Suspicious compression ratio in {path.name}: {raw!r}")
+                      bad = zf.testzip()
+                      if bad:
+                          raise RuntimeError(f"ZIP CRC check failed in {path.name}: {bad}")
+              except zipfile.BadZipFile as exc:
+                  raise RuntimeError(f"Invalid ZIP archive {path}: {exc}") from exc
+
+
+          def safe_extract(path: Path, destination: Path) -> None:
+              validate_archive(path)
+              destination.mkdir(parents=True, exist_ok=True)
+              with zipfile.ZipFile(path) as zf:
+                  zf.extractall(destination)
+
+
+          def find_extracted_root(folder: Path, marker: str, required: tuple[str, ...], required_dir: str | None = None) -> Path:
+              matches: list[Path] = []
+              for marker_file in folder.rglob(marker):
+                  if not marker_file.is_file():
+                      continue
+                  root = marker_file.parent
+                  if all((root / rel).is_file() for rel in required) and (required_dir is None or (root / required_dir).is_dir()):
+                      matches.append(root)
+              unique = sorted(set(matches))
+              if len(unique) != 1:
+                  raise RuntimeError(f"Expected exactly one extracted project root for {marker}; found: {unique}")
+              return unique[0]
+
+
+          def write_github_env(key: str, value: str) -> None:
+              env_file = os.environ.get("GITHUB_ENV")
+              if env_file:
+                  if "\n" in value or "\r" in value:
+                      raise RuntimeError(f"Invalid newline in GitHub environment value {key}")
+                  with open(env_file, "a", encoding="utf-8") as stream:
+                      stream.write(f"{key}={value}\n")
+
+
+          def main() -> int:
+              use_patches = os.environ.get("USE_PATCHES", "true").lower() == "true"
+              candidates = candidate_zips()
+              if not candidates:
+                  raise RuntimeError("No ZIP files found in repository root, source/, or patches/.")
+
+              detected: list[tuple[Path, str, str]] = []
+              for archive in candidates:
+                  names = zip_member_names(archive)
+                  if names is None:
+                      continue
+                  role, root = classify(archive, names)
+                  if role:
+                      detected.append((archive, role, root or ""))
+
+              bases = [(p, r) for p, role, r in detected if role == "base"]
+              folias = [(p, r) for p, role, r in detected if role == "folia"]
+              patches = [(p, r) for p, role, r in detected if role == "patch"] if use_patches else []
+              if len(bases) != 1:
+                  listing = ", ".join(p.relative_to(WORKSPACE).as_posix() for p, _ in bases) or "none"
+                  raise RuntimeError(f"Expected exactly one Halcyon ZIP with settings.gradle.kts + project markers; found {len(bases)}: {listing}")
+              if len(folias) > 1:
+                  listing = ", ".join(p.relative_to(WORKSPACE).as_posix() for p, _ in folias)
+                  raise RuntimeError(f"Found multiple Folia ZIPs; keep only one source archive: {listing}")
+              if use_patches and len(patches) != 1:
+                  listing = ", ".join(p.relative_to(WORKSPACE).as_posix() for p, _ in patches) or "none"
+                  raise RuntimeError(f"Patching is enabled but exactly one merged patch ZIP is required; found {len(patches)}: {listing}. Remove old per-task patch ZIPs.")
+
+              selected_archives = [bases[0][0]] + ([folias[0][0]] if folias else []) + ([patches[0][0]] if patches else [])
+              for path in selected_archives:
+                  validate_archive(path)
+
+              shutil.rmtree(STAGING, ignore_errors=True)
+              shutil.rmtree(WORKSPACE / "build", ignore_errors=True)
+              shutil.rmtree(WORKSPACE / "folia", ignore_errors=True)
+              base_archive, _base_root_name = bases[0]
+              base_stage = STAGING / "base"
+              safe_extract(base_archive, base_stage)
+              base_root = find_extracted_root(
+                  base_stage, "settings.gradle.kts",
+                  ("gradlew", "app/build.gradle.kts", "tools/check_licenses.py"),
+              )
+              build_root = WORKSPACE / "build"
+              shutil.copytree(base_root, build_root)
+
+              have_folia = False
+              folia_zip_name = ""
+              if folias:
+                  folia_archive, _ = folias[0]
+                  folia_stage = STAGING / "folia"
+                  safe_extract(folia_archive, folia_stage)
+                  folia_root = find_extracted_root(
+                      folia_stage, "vite.config.ts", ("package.json", "package-lock.json"), "src/components/visualizer",
+                  )
+                  if not any((folia_root / "src/components/visualizer").rglob("*")):
+                      raise RuntimeError("The selected Folia ZIP is missing src/components/visualizer content.")
+                  shutil.copytree(folia_root, WORKSPACE / "folia")
+                  have_folia = True
+                  folia_zip_name = folia_archive.relative_to(WORKSPACE).as_posix()
+                  print(f"Folia source: {folia_zip_name}")
+              else:
+                  print("::warning::No Folia source ZIP found; native Halcyon styles will be used.")
+
+              applied = 0
+              if use_patches:
+                  patch_archive, _ = patches[0]
+                  patch_stage = STAGING / "patch"
+                  safe_extract(patch_archive, patch_stage)
+                  apply_scripts = [p for p in patch_stage.rglob("apply.py") if p.is_file()]
+                  patch_roots = [p.parent for p in apply_scripts if (p.parent / "files").is_dir() or (p.parent / "folia-host").is_dir()]
+                  if len(patch_roots) != 1:
+                      raise RuntimeError(f"Expected one patch root with apply.py + files/ or folia-host/; found {patch_roots}")
+                  patch_root = patch_roots[0]
+                  patch_files = patch_root / "files"
+                  patch_host = patch_root / "folia-host"
+                  if patch_files.is_dir():
+                      shutil.copytree(patch_files, build_root, dirs_exist_ok=True)
+                  if patch_host.is_dir() and have_folia:
+                      shutil.copytree(patch_host, WORKSPACE / "folia", dirs_exist_ok=True)
+                  subprocess.run([sys.executable, str(patch_root / "apply.py"), str(build_root)], cwd=WORKSPACE, check=True)
+                  applied = 1
+                  print(f"Applied merged patch: {patch_archive.relative_to(WORKSPACE).as_posix()}")
+
+              if have_folia and not all((WORKSPACE / rel).is_file() for rel in ("folia/halcyon-host.html", "folia/vite.halcyon.config.ts")):
+                  print("::warning::Folia host entry/config is missing; skipping Folia web bundle and using native fallback.")
+                  have_folia = False
+
+              base_root_text = str(base_root)
+              base_zip_text = base_archive.relative_to(WORKSPACE).as_posix()
+              patch_zip_text = patches[0][0].relative_to(WORKSPACE).as_posix() if patches else ""
+              for key, value in (
+                  ("BASE_ROOT", base_root_text),
+                  ("BASE_ZIP", base_zip_text),
+                  ("FOLIA_ZIP", folia_zip_name),
+                  ("PATCH_ZIP", patch_zip_text),
+                  ("HAVE_FOLIA", "true" if have_folia else "false"),
+                  ("PATCHES_APPLIED", str(applied)),
+              ):
+                  write_github_env(key, value)
+
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as stream:
+                      stream.write("## Imported source archives\n\n")
+                      stream.write(f"- Halcyon: `{base_zip_text}`\n")
+                      stream.write(f"- Folia: `{folia_zip_name or 'not supplied (native fallback)'}`\n")
+                      stream.write(f"- Patch: `{patch_zip_text or 'disabled'}`\n")
+                      stream.write(f"- Patch applied: `{applied}`\n")
+                      stream.write(f"- Folia web host available: `{str(have_folia).lower()}`\n")
+              print(f"Imported Halcyon source: {base_zip_text}")
+              print(f"Patch archives applied: {applied}; Folia enabled: {str(have_folia).lower()}")
+              return 0
+
+
+          if __name__ == "__main__":
+              try:
+                  raise SystemExit(main())
+              except Exception as exc:
+                  print(f"::error::{exc}", file=sys.stderr)
+                  raise SystemExit(1)
+          PY
+          python3 -m py_compile "$RUNNER_TEMP/import_sources.py"
+          python3 "$RUNNER_TEMP/import_sources.py"
+      - name: Import source archives safely and apply the merged patch
+        id: import
+        shell: bash
+        env:
+          USE_PATCHES: ${{ env.USE_PATCHES }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/import_sources.py" <<'PY'
+          #!/usr/bin/env python3
+          """Safely import Halcyon, Folia and patch source archives for CI builds."""
+          from __future__ import annotations
+
+          import hashlib
+          import os
+          import shutil
+          import stat
+          import subprocess
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          WORKSPACE = Path.cwd().resolve()
+          RUNNER_TEMP = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
+          STAGING = RUNNER_TEMP / "halcyon-import"
+          MAX_ENTRIES = 40_000
+          MAX_TOTAL_UNCOMPRESSED = 900 * 1024 * 1024
+          MAX_ARCHIVE_COMPRESSED = 300 * 1024 * 1024
+          MAX_COMPRESSION_RATIO = 2_000
+
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def candidate_zips() -> list[Path]:
+              found: set[Path] = set()
+              for folder in (WORKSPACE, WORKSPACE / "source", WORKSPACE / "patches"):
+                  if not folder.exists():
+                      continue
+                  if folder != WORKSPACE and folder.is_symlink():
+                      raise RuntimeError(f"Archive input directory must not be a symlink: {folder.name}/")
+                  for path in folder.glob("*.zip") if folder == WORKSPACE else folder.rglob("*.zip"):
+                      if path.is_symlink():
+                          raise RuntimeError(f"ZIP input must not be a symlink: {path.relative_to(WORKSPACE)}")
+                      if path.is_file() and ".git" not in path.parts:
+                          rel = path.relative_to(WORKSPACE).as_posix()
+                          if "\n" in rel or "\r" in rel:
+                              raise RuntimeError(f"ZIP filename contains a newline: {rel!r}")
+                          resolved = path.resolve(strict=True)
+                          try:
+                              resolved.relative_to(WORKSPACE)
+                          except ValueError as exc:
+                              raise RuntimeError(f"ZIP resolves outside repository workspace: {rel}") from exc
+                          found.add(resolved)
+              return sorted(found, key=lambda p: p.relative_to(WORKSPACE).as_posix().casefold())
+
+
+          def zip_member_names(path: Path) -> list[str] | None:
+              try:
+                  with zipfile.ZipFile(path) as zf:
+                      return [i.filename for i in zf.infolist()]
+              except (OSError, zipfile.BadZipFile, RuntimeError):
+                  print(f"::warning::Ignoring unreadable/non-project ZIP: {path.relative_to(WORKSPACE)}")
+                  return None
+
+
+          def rooted(names: list[str], marker: str, required: tuple[str, ...]) -> list[str]:
+              roots: set[str] = set()
+              for raw in names:
+                  normalized = raw.rstrip("/")
+                  if not normalized or PurePosixPath(normalized).name != marker:
+                      continue
+                  parent = str(PurePosixPath(normalized).parent)
+                  root = "" if parent == "." else parent
+                  present = set(names)
+                  def exists(rel: str) -> bool:
+                      candidate = f"{root}/{rel}" if root else rel
+                      return candidate in present
+                  if all(exists(item) for item in required):
+                      roots.add(root)
+              return sorted(roots)
+
+
+          def classify(path: Path, names: list[str]) -> tuple[str | None, str | None]:
+              base_roots = rooted(
+                  names,
+                  "settings.gradle.kts",
+                  ("gradlew", "app/build.gradle.kts", "tools/check_licenses.py"),
+              )
+              folia_roots = rooted(
+                  names,
+                  "vite.config.ts",
+                  ("package.json", "package-lock.json"),
+              )
+              # The visualizer path must live under the same project root as package.json.
+              folia_roots = [
+                  root for root in folia_roots
+                  if any(
+                      n.startswith((f"{root}/" if root else "") + "src/components/visualizer/")
+                      for n in names
+                  )
+              ]
+              patch_roots: set[str] = set()
+              for root in rooted(names, "apply.py", ()):
+                  prefix = f"{root}/" if root else ""
+                  if any(n.startswith(prefix + "files/") for n in names) or any(
+                      n.startswith(prefix + "folia-host/") for n in names
+                  ):
+                      patch_roots.add(root)
+              if len(base_roots) > 1:
+                  raise RuntimeError(f"{path.name}: multiple Halcyon project roots inside one ZIP: {base_roots}")
+              if len(folia_roots) > 1:
+                  raise RuntimeError(f"{path.name}: multiple Folia project roots inside one ZIP: {folia_roots}")
+              roles = []
+              if base_roots:
+                  roles.append(("base", base_roots[0]))
+              if folia_roots:
+                  roles.append(("folia", folia_roots[0]))
+              if patch_roots:
+                  if len(patch_roots) != 1:
+                      raise RuntimeError(f"{path.name}: multiple patch roots inside one ZIP: {sorted(patch_roots)}")
+                  roles.append(("patch", sorted(patch_roots)[0]))
+              if len(roles) > 1:
+                  raise RuntimeError(f"{path.name}: archive ambiguously matches multiple input types: {roles}")
+              return roles[0] if roles else (None, None)
+
+
+          def validate_archive(path: Path) -> None:
+              if path.stat().st_size > MAX_ARCHIVE_COMPRESSED:
+                  raise RuntimeError(f"ZIP is too large on disk ({path.stat().st_size} bytes): {path}")
+              try:
+                  with zipfile.ZipFile(path) as zf:
+                      infos = zf.infolist()
+                      if len(infos) > MAX_ENTRIES:
+                          raise RuntimeError(f"Too many ZIP entries ({len(infos)}): {path.name}")
+                      total = 0
+                      seen: dict[str, bool] = {}
+                      for info in infos:
+                          raw = info.filename
+                          if not raw or "\x00" in raw or "\\" in raw or "\n" in raw or "\r" in raw:
+                              raise RuntimeError(f"Unsafe ZIP member name in {path.name}: {raw!r}")
+                          trimmed = raw[:-1] if raw.endswith("/") else raw
+                          member = PurePosixPath(trimmed)
+                          if member.is_absolute() or not trimmed or any(part in ("", ".", "..") for part in trimmed.split("/")):
+                              raise RuntimeError(f"Unsafe ZIP path in {path.name}: {raw!r}")
+                          if member.parts and (":" in member.parts[0] or member.parts[0].startswith("~")):
+                              raise RuntimeError(f"Drive/home path is not allowed in {path.name}: {raw!r}")
+                          normalized = member.as_posix()
+                          is_dir = info.is_dir()
+                          if normalized in seen and not (is_dir and seen[normalized]):
+                              raise RuntimeError(f"Duplicate ZIP member in {path.name}: {normalized}")
+                          seen[normalized] = is_dir
+                          mode = (info.external_attr >> 16) & 0xFFFF
+                          kind = stat.S_IFMT(mode)
+                          if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                              raise RuntimeError(f"Symlink/special file is not allowed in {path.name}: {raw!r}")
+                          if info.flag_bits & 0x1:
+                              raise RuntimeError(f"Encrypted ZIP entries are not supported: {path.name}")
+                          if not is_dir:
+                              total += info.file_size
+                              if total > MAX_TOTAL_UNCOMPRESSED:
+                                  raise RuntimeError(f"Uncompressed ZIP exceeds safety limit: {path.name}")
+                              if info.file_size > 1024 * 1024:
+                                  if info.compress_size == 0 or info.file_size / info.compress_size > MAX_COMPRESSION_RATIO:
+                                      raise RuntimeError(f"Suspicious compression ratio in {path.name}: {raw!r}")
+                      bad = zf.testzip()
+                      if bad:
+                          raise RuntimeError(f"ZIP CRC check failed in {path.name}: {bad}")
+              except zipfile.BadZipFile as exc:
+                  raise RuntimeError(f"Invalid ZIP archive {path}: {exc}") from exc
+
+
+          def safe_extract(path: Path, destination: Path) -> None:
+              validate_archive(path)
+              destination.mkdir(parents=True, exist_ok=True)
+              with zipfile.ZipFile(path) as zf:
+                  zf.extractall(destination)
+
+
+          def find_extracted_root(folder: Path, marker: str, required: tuple[str, ...], required_dir: str | None = None) -> Path:
+              matches: list[Path] = []
+              for marker_file in folder.rglob(marker):
+                  if not marker_file.is_file():
+                      continue
+                  root = marker_file.parent
+                  if all((root / rel).is_file() for rel in required) and (required_dir is None or (root / required_dir).is_dir()):
+                      matches.append(root)
+              unique = sorted(set(matches))
+              if len(unique) != 1:
+                  raise RuntimeError(f"Expected exactly one extracted project root for {marker}; found: {unique}")
+              return unique[0]
+
+
+          def write_github_env(key: str, value: str) -> None:
+              env_file = os.environ.get("GITHUB_ENV")
+              if env_file:
+                  if "\n" in value or "\r" in value:
+                      raise RuntimeError(f"Invalid newline in GitHub environment value {key}")
+                  with open(env_file, "a", encoding="utf-8") as stream:
+                      stream.write(f"{key}={value}\n")
+
+
+          def main() -> int:
+              use_patches = os.environ.get("USE_PATCHES", "true").lower() == "true"
+              candidates = candidate_zips()
+              if not candidates:
+                  raise RuntimeError("No ZIP files found in repository root, source/, or patches/.")
+
+              detected: list[tuple[Path, str, str]] = []
+              for archive in candidates:
+                  names = zip_member_names(archive)
+                  if names is None:
+                      continue
+                  role, root = classify(archive, names)
+                  if role:
+                      detected.append((archive, role, root or ""))
+
+              bases = [(p, r) for p, role, r in detected if role == "base"]
+              folias = [(p, r) for p, role, r in detected if role == "folia"]
+              patches = [(p, r) for p, role, r in detected if role == "patch"] if use_patches else []
+              if len(bases) != 1:
+                  listing = ", ".join(p.relative_to(WORKSPACE).as_posix() for p, _ in bases) or "none"
+                  raise RuntimeError(f"Expected exactly one Halcyon ZIP with settings.gradle.kts + project markers; found {len(bases)}: {listing}")
+              if len(folias) > 1:
+                  listing = ", ".join(p.relative_to(WORKSPACE).as_posix() for p, _ in folias)
+                  raise RuntimeError(f"Found multiple Folia ZIPs; keep only one source archive: {listing}")
+              if use_patches and len(patches) != 1:
+                  listing = ", ".join(p.relative_to(WORKSPACE).as_posix() for p, _ in patches) or "none"
+                  raise RuntimeError(f"Patching is enabled but exactly one merged patch ZIP is required; found {len(patches)}: {listing}. Remove old per-task patch ZIPs.")
+
+              selected_archives = [bases[0][0]] + ([folias[0][0]] if folias else []) + ([patches[0][0]] if patches else [])
+              for path in selected_archives:
+                  validate_archive(path)
+
+              shutil.rmtree(STAGING, ignore_errors=True)
+              shutil.rmtree(WORKSPACE / "build", ignore_errors=True)
+              shutil.rmtree(WORKSPACE / "folia", ignore_errors=True)
+              base_archive, _base_root_name = bases[0]
+              base_stage = STAGING / "base"
+              safe_extract(base_archive, base_stage)
+              base_root = find_extracted_root(
+                  base_stage, "settings.gradle.kts",
+                  ("gradlew", "app/build.gradle.kts", "tools/check_licenses.py"),
+              )
+              build_root = WORKSPACE / "build"
+              shutil.copytree(base_root, build_root)
+
+              have_folia = False
+              folia_zip_name = ""
+              if folias:
+                  folia_archive, _ = folias[0]
+                  folia_stage = STAGING / "folia"
+                  safe_extract(folia_archive, folia_stage)
+                  folia_root = find_extracted_root(
+                      folia_stage, "vite.config.ts", ("package.json", "package-lock.json"), "src/components/visualizer",
+                  )
+                  if not any((folia_root / "src/components/visualizer").rglob("*")):
+                      raise RuntimeError("The selected Folia ZIP is missing src/components/visualizer content.")
+                  shutil.copytree(folia_root, WORKSPACE / "folia")
+                  have_folia = True
+                  folia_zip_name = folia_archive.relative_to(WORKSPACE).as_posix()
+                  print(f"Folia source: {folia_zip_name}")
+              else:
+                  print("::warning::No Folia source ZIP found; native Halcyon styles will be used.")
+
+              applied = 0
+              if use_patches:
+                  patch_archive, _ = patches[0]
+                  patch_stage = STAGING / "patch"
+                  safe_extract(patch_archive, patch_stage)
+                  apply_scripts = [p for p in patch_stage.rglob("apply.py") if p.is_file()]
+                  patch_roots = [p.parent for p in apply_scripts if (p.parent / "files").is_dir() or (p.parent / "folia-host").is_dir()]
+                  if len(patch_roots) != 1:
+                      raise RuntimeError(f"Expected one patch root with apply.py + files/ or folia-host/; found {patch_roots}")
+                  patch_root = patch_roots[0]
+                  patch_files = patch_root / "files"
+                  patch_host = patch_root / "folia-host"
+                  if patch_files.is_dir():
+                      shutil.copytree(patch_files, build_root, dirs_exist_ok=True)
+                  if patch_host.is_dir() and have_folia:
+                      shutil.copytree(patch_host, WORKSPACE / "folia", dirs_exist_ok=True)
+                  subprocess.run([sys.executable, str(patch_root / "apply.py"), str(build_root)], cwd=WORKSPACE, check=True)
+                  applied = 1
+                  print(f"Applied merged patch: {patch_archive.relative_to(WORKSPACE).as_posix()}")
+
+              if have_folia and not all((WORKSPACE / rel).is_file() for rel in ("folia/halcyon-host.html", "folia/vite.halcyon.config.ts")):
+                  print("::warning::Folia host entry/config is missing; skipping Folia web bundle and using native fallback.")
+                  have_folia = False
+
+              base_root_text = str(base_root)
+              base_zip_text = base_archive.relative_to(WORKSPACE).as_posix()
+              patch_zip_text = patches[0][0].relative_to(WORKSPACE).as_posix() if patches else ""
+              for key, value in (
+                  ("BASE_ROOT", base_root_text),
+                  ("BASE_ZIP", base_zip_text),
+                  ("FOLIA_ZIP", folia_zip_name),
+                  ("PATCH_ZIP", patch_zip_text),
+                  ("HAVE_FOLIA", "true" if have_folia else "false"),
+                  ("PATCHES_APPLIED", str(applied)),
+              ):
+                  write_github_env(key, value)
+
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as stream:
+                      stream.write("## Imported source archives\n\n")
+                      stream.write(f"- Halcyon: `{base_zip_text}`\n")
+                      stream.write(f"- Folia: `{folia_zip_name or 'not supplied (native fallback)'}`\n")
+                      stream.write(f"- Patch: `{patch_zip_text or 'disabled'}`\n")
+                      stream.write(f"- Patch applied: `{applied}`\n")
+                      stream.write(f"- Folia web host available: `{str(have_folia).lower()}`\n")
+              print(f"Imported Halcyon source: {base_zip_text}")
+              print(f"Patch archives applied: {applied}; Folia enabled: {str(have_folia).lower()}")
+              return 0
+
+
+          if __name__ == "__main__":
+              try:
+                  raise SystemExit(main())
+              except Exception as exc:
+                  print(f"::error::{exc}", file=sys.stderr)
+                  raise SystemExit(1)
+          PY
+          python3 -m py_compile "$RUNNER_TEMP/import_sources.py"
+          python3 "$RUNNER_TEMP/import_sources.py"
+
+      - name: Set up Node.js 24 for Folia
         if: ${{ env.HAVE_FOLIA == 'true' }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
           cache: npm
@@ -162,16 +734,18 @@ jobs:
         id: npm_install
         if: ${{ env.HAVE_FOLIA == 'true' }}
         continue-on-error: true
+        timeout-minutes: 20
         working-directory: folia
         shell: bash
         run: |
           set -euo pipefail
-          npm ci --ignore-scripts --no-audit --no-fund 2>&1 | tail -40
+          npm ci --ignore-scripts --no-audit --no-fund 2>&1 | tee ../npm-install.log | tail -60
 
-      - name: Build Folia visualizer bundle (web)
+      - name: Build Folia visualizer bundle
         id: folia_build
         if: ${{ env.HAVE_FOLIA == 'true' && steps.npm_install.outcome == 'success' }}
         continue-on-error: true
+        timeout-minutes: 30
         working-directory: folia
         shell: bash
         env:
@@ -179,7 +753,7 @@ jobs:
           ELECTRON: "false"
         run: |
           set -euo pipefail
-          npx vite build -c vite.halcyon.config.ts 2>&1 | tee ../folia-build.log | tail -60
+          npx vite build -c vite.halcyon.config.ts 2>&1 | tee ../folia-build.log | tail -80
           test -f dist-halcyon/halcyon-host.html
 
       - name: Bake the Folia bundle into the APK assets
@@ -192,44 +766,56 @@ jobs:
           du -sh build/app/src/main/assets/folia
           echo "FOLIA_BAKED=true" >> "$GITHUB_ENV"
 
-      - name: Folia bundle status
+      - name: Folia bundle fallback summary
         if: ${{ always() && env.HAVE_FOLIA == 'true' && steps.folia_build.outcome != 'success' }}
         shell: bash
         run: |
           {
-            echo "## Folia bundle was not built"
-            echo "The APK still builds and uses the built-in native styles. Last lines of the web build:"
+            echo "## Folia web bundle unavailable"
+            echo "The APK build will continue with Halcyon's built-in native visualizer."
             echo '```'
-            tail -40 folia-build.log 2>/dev/null || echo "(no log - dependency install failed)"
+            tail -60 folia-build.log 2>/dev/null || tail -60 npm-install.log 2>/dev/null || echo "No web build log was produced."
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Application license provenance check
-        continue-on-error: true
+      - name: Application licence and provenance check
         working-directory: build
-        run: python3 tools/check_licenses.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/check_licenses.py
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: "21"
+          problem-matcher: true
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
-          packages: ''
+          packages: ""
 
       - name: Install Android SDK packages
+        timeout-minutes: 20
         shell: bash
         run: |
-          yes | sdkmanager --licenses || true
+          set -euo pipefail
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          license_status=${PIPESTATUS[1]}
+          set -o pipefail
+          if [ "$license_status" -ne 0 ]; then
+            echo "::error::Android SDK licences were not accepted."
+            exit "$license_status"
+          fi
           sdkmanager \
             "platform-tools" \
             "cmake;3.22.1" \
             "ndk;28.2.13676358"
           if ! sdkmanager --channel=3 "platforms;android-37"; then
-            echo "platforms;android-37 is unavailable from sdkmanager; using android-36 as a CI compatibility platform."
+            echo "platforms;android-37 unavailable; creating the same compatibility fallback used by the previous workflow from android-36."
             sdkmanager "platforms;android-36"
             mkdir -p "$ANDROID_HOME/platforms/android-37"
             cp -a "$ANDROID_HOME/platforms/android-36/." "$ANDROID_HOME/platforms/android-37/"
@@ -237,11 +823,11 @@ jobs:
           fi
           sdkmanager --channel=3 "build-tools;37.0.0" || sdkmanager "build-tools;36.0.0"
 
-      # A release APK is debug-signed here. Keeping one debug key in the Actions cache means each
-      # new build can be installed over the previous one without uninstalling.
-      - name: Restore signing key
+      # The cached debug key gives repeated debug-signed Release APKs the same signer,
+      # allowing the user to install an update over the previous test build.
+      - name: Restore the stable debug signing key
         id: key_restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6.1.0
         with:
           path: ~/.android/debug.keystore
           key: halcyon-debug-keystore-v1
@@ -249,65 +835,72 @@ jobs:
       - name: Create signing key if missing
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p ~/.android
-          if [ ! -f ~/.android/debug.keystore ]; then
+          if [ ! -s ~/.android/debug.keystore ]; then
             keytool -genkeypair -v -keystore ~/.android/debug.keystore -storepass android -keypass android \
-              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
           fi
 
       - name: Save signing key
         if: ${{ always() && steps.key_restore.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6.1.0
         with:
           path: ~/.android/debug.keystore
           key: halcyon-debug-keystore-v1
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
         with:
           build-root-directory: build
+          validate-wrappers: true
 
-      - name: Build APK (with patches)
+      - name: Build APK with the merged patch
         id: build
         continue-on-error: true
+        timeout-minutes: 75
         shell: bash
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
           ALLOW_DEBUG_SIGNED_RELEASE: "true"
         run: |
+          set -euo pipefail
           cd build
           chmod +x ./gradlew
           TASK=":app:assembleRelease"
           if [ "$BUILD_TYPE" = "debug" ]; then TASK=":app:assembleDebug"; fi
           set +e
           ./gradlew --no-daemon "$TASK" -PellaAbi=arm64-v8a --stacktrace 2>&1 | tee ../build.log
-          exit "${PIPESTATUS[0]}"
+          build_status=${PIPESTATUS[0]}
+          set -e
+          exit "$build_status"
 
-      - name: Show compiler errors
+      - name: Explain patched build failure
         if: ${{ always() && steps.build.outcome == 'failure' }}
         shell: bash
         run: |
           {
-            echo "## Build failed"
-            echo "Patch zips applied: $PATCHES_APPLIED"
-            echo
+            echo "## Patched APK build failed"
+            echo "Merged patch applied: $PATCHES_APPLIED"
+            echo "A plain Halcyon fallback will be attempted when patches were enabled. The workflow will still finish as failed so the patched build error is not hidden."
             echo '```'
-            grep -E '^e: |error:|FAILED|What went wrong' build.log | head -60 || true
+            grep -E '^e: |error:|FAILED|What went wrong' build.log | head -80 || true
             echo '```'
-            echo
-            echo "The full log is attached to this run as **build-log**."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fallback - build the plain app (patches failed to compile)
+      - name: Fallback - build unmodified Halcyon if patched Kotlin fails
         id: fallback
         if: ${{ steps.build.outcome == 'failure' && env.PATCHES_APPLIED != '0' }}
+        timeout-minutes: 75
         shell: bash
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
           ALLOW_DEBUG_SIGNED_RELEASE: "true"
         run: |
+          set -euo pipefail
           rm -rf build-base
-          mkdir build-base
+          mkdir -p build-base
           cp -a "$BASE_ROOT/." build-base/
           cd build-base
           chmod +x ./gradlew
@@ -315,29 +908,49 @@ jobs:
           if [ "$BUILD_TYPE" = "debug" ]; then TASK=":app:assembleDebug"; fi
           set +e
           ./gradlew --no-daemon "$TASK" -PellaAbi=arm64-v8a --stacktrace 2>&1 | tee ../build-base.log
-          exit "${PIPESTATUS[0]}"
+          fallback_status=${PIPESTATUS[0]}
+          set -e
+          exit "$fallback_status"
 
-      - name: List APK outputs
+      - name: Collect build information and APK outputs
         if: ${{ always() }}
         shell: bash
         run: |
-          find build build-base -path '*outputs*' \( -name '*.apk' -o -name '*.APK' \) -print -exec ls -lh {} \; 2>/dev/null || true
+          set -euo pipefail
+          mkdir -p build-reports
+          {
+            echo "Halcyon + Folia build information"
+            echo "Commit: $GITHUB_SHA"
+            echo "Build type: $BUILD_TYPE"
+            echo "Patches enabled: $USE_PATCHES"
+            echo "Patch archives applied: ${PATCHES_APPLIED:-0}"
+            echo "Folia archive: ${FOLIA_ZIP:-none}"
+            echo "Folia bundle baked: ${FOLIA_BAKED:-false}"
+            echo
+            echo "Input archive SHA-256 values:"
+            [ -f "$BASE_ZIP" ] && sha256sum "$BASE_ZIP" || true
+            [ -n "${FOLIA_ZIP:-}" ] && [ -f "$FOLIA_ZIP" ] && sha256sum "$FOLIA_ZIP" || true
+            [ -n "${PATCH_ZIP:-}" ] && [ -f "$PATCH_ZIP" ] && sha256sum "$PATCH_ZIP" || true
+          } > build-reports/build-info.txt
+          find build build-base -path '*outputs*' \( -iname '*.apk' \) -type f -print -exec ls -lh {} \; 2>/dev/null || true
 
-      - name: Upload APK (patched app)
+      - name: Upload patched APK
         if: ${{ steps.build.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: Halcyon-visualizer-${{ env.BUILD_TYPE }}-arm64-v8a-${{ github.run_number }}
+          name: Halcyon-Folia-${{ env.BUILD_TYPE }}-arm64-v8a-${{ github.run_number }}
           path: |
             build/app/build/outputs/apk/release/*arm64-v8a*.apk
             build/app/build/outputs/apk/debug/*arm64-v8a*.apk
             build/app/build/outputs/renamed-apk/release/*arm64-v8a*.APK
             build/app/build/outputs/renamed-apk/debug/*arm64-v8a*.APK
           if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
 
-      - name: Upload APK (plain fallback app)
+      - name: Upload plain fallback APK
         if: ${{ steps.fallback.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Halcyon-PLAIN-fallback-${{ env.BUILD_TYPE }}-arm64-v8a-${{ github.run_number }}
           path: |
@@ -346,21 +959,26 @@ jobs:
             build-base/app/build/outputs/renamed-apk/release/*arm64-v8a*.APK
             build-base/app/build/outputs/renamed-apk/debug/*arm64-v8a*.APK
           if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
 
-      - name: Upload build logs
+      - name: Upload logs and build report
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: build-log
+          name: Halcyon-build-logs-${{ github.run_number }}
           path: |
             build.log
             build-base.log
             folia-build.log
+            npm-install.log
+            build-reports/build-info.txt
           if-no-files-found: ignore
+          retention-days: 7
 
-      - name: Mark the run as failed when the patched build did not compile
+      - name: Mark the run failed if patched compilation failed
         if: ${{ steps.build.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::error::The patched app did not compile. A plain fallback APK was built if possible; send the errors from the run summary / build-log artifact."
+          echo "::error::The patched build failed. The plain fallback APK, if built, is available separately. Download the build-log artifact and share it for diagnosis."
           exit 1
